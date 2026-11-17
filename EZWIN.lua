@@ -2,52 +2,20 @@
     EZ WIN  |  by orang ganteng
     Library: https://sirius.menu/rayfield (official loader)
     Docs:    https://docs.sirius.menu/rayfield
-
-    HOW TO CUSTOMIZE:
-    - Every element has a `Callback` function. Put your own logic inside it.
-    - Toggle callback   -> receives (Value: boolean)
-    - Slider callback   -> receives (Value: number)
-    - Dropdown callback -> receives (Options: table) -- use Options[1] for single select.
-    - Button callback   -> receives nothing.
-    - Each element's `Flag` must be unique if ConfigurationSaving is enabled.
-    - Elements WITHOUT a Flag are not saved: Anchor, Float and Aimbot toggles (so you never load frozen/floating/aiming). The Main tab (speed, jump, inf jump) is saved.
-
-    SPEED LOGIC (one source of truth: State.SpeedMode):
-    - "Speed Preset" dropdown: Default / Fast / Turbo / Custom.
-    - "Enable Custom Walk Speed" toggle is just a shortcut for the "Custom" preset:
-        ON  -> preset switches to "Custom" and the Walk Speed slider is used.
-        OFF -> preset returns to "Default".
-    - Picking any fixed preset (Default/Fast/Turbo) turns the custom toggle OFF.
-    - Picking "Custom" in the dropdown turns the custom toggle ON.
-    - The Walk Speed slider only has an effect while the mode is "Custom".
-
-    SIZE / DRAGGING:
-    - PROMPT_SCALE below controls the minimized "Show EZ WIN" button size (0.90 = 90%).
-    - The minimized "Show EZ WIN" button and the "Anchor: OFF/ON" button can be dragged.
-      A quick tap still activates them; moving more than DRAG_THRESHOLD pixels only drags.
-    - WINDOW_SCALE below scales only the Rayfield window itself (0.85 = 85%).
-      The minimized button and the Anchor button keep their own sizes.
-    - Survive tab: "Teleport Up 170 Studs & Float" (+ movable Float button). OFF drops you to the ground below.
-    - Scripts tab: Mobile Aimbot. The toggle shows a movable Aim button; tap it to start/stop locking.
-    - The main window can be resized by dragging the grip in its bottom-right
-      corner (mouse or touch). Limits are in RESIZE_CONFIG.
 ]]
 
---// Services
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
 
---// Settings
 local HUB_NAME = "EZ WIN"
 local HUB_CREDIT = "by orang ganteng"
-local PROMPT_SCALE = 0.90      -- minimized "Show EZ WIN" button size
-local WINDOW_SCALE = 0.85      -- Rayfield window size (1 = 100%). Only the window, not the other buttons
-local DRAG_THRESHOLD = 8       -- pixels of movement before a tap becomes a drag
+local PROMPT_SCALE = 0.90
+local WINDOW_SCALE = 0.85
+local DRAG_THRESHOLD = 8
 
---// Safe library loading
 local ok, Rayfield = pcall(function()
     return loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 end)
@@ -57,7 +25,6 @@ if not ok or type(Rayfield) ~= "table" then
     return
 end
 
---// Helper: wrap callbacks so one error never breaks the UI
 local function safe(name, fn)
     return function(...)
         local success, err = pcall(fn, ...)
@@ -72,18 +39,31 @@ local function safe(name, fn)
     end
 end
 
---// Helper: get the player's Humanoid (nil-safe)
 local function getHumanoid()
     local character = LocalPlayer and LocalPlayer.Character
     return character and character:FindFirstChildOfClass("Humanoid")
 end
 
---// State (kept local to avoid polluting the global environment)
+local function isAlive(humanoid)
+    return humanoid ~= nil and humanoid.Health > 0
+end
+
+local function disconnect(connection)
+    if connection then
+        connection:Disconnect()
+    end
+end
+
+local function disconnectAll(connections)
+    for _, connection in ipairs(connections) do
+        connection:Disconnect()
+    end
+end
+
 local State = {
     -- Speed: ONE mode decides everything. "Default" | "Fast" | "Turbo" | "Custom"
     SpeedMode = "Default",
     SpeedValue = 16,           -- slider value, only used while SpeedMode == "Custom"
-    DefaultSpeed = 16,
 
     JumpEnabled = false,
     JumpValue = 50,
@@ -95,22 +75,16 @@ local State = {
     Notifications = true,
 }
 
--- Everything about the anchor feature lives here (state, button, connections)
 local Anchor = {
     Active = false,
-    Saved = nil,               -- original Humanoid values, restored when unanchoring
+    Saved = nil,
     Heartbeat = nil,
-    Died = nil,
-    Toggle = nil,              -- Rayfield toggle (kept in sync with Active)
-    Gui = nil,                 -- on-screen button (nil when hidden)
+    Toggle = nil,
     Button = nil,
-    Scale = nil,
-    ButtonReady = false,       -- true while the character is alive
-    Pos = nil,                 -- remembered button position (session only)
+    OnRelease = nil,
 }
 
-local UI = {}                  -- Rayfield elements that need to be kept in sync
-local Connections = {}         -- general connections, disconnected on unload
+local UI = {}
 
 local Presets = {
     Default = 16,
@@ -128,15 +102,19 @@ local function syncElement(element, value)
     end
 end
 
---// Speed the character should have right now
+local function notify(title, content)
+    if State.Notifications then
+        Rayfield:Notify({ Title = title, Content = content, Duration = 3 })
+    end
+end
+
 local function getTargetSpeed()
     if State.SpeedMode == "Custom" then
         return State.SpeedValue
     end
-    return Presets[State.SpeedMode] or State.DefaultSpeed
+    return Presets[State.SpeedMode]
 end
 
---// Apply walk speed (skipped while anchored so the lock isn't overridden)
 local function applySpeed()
     if Anchor.Active then return end
     local humanoid = getHumanoid()
@@ -159,17 +137,12 @@ local function setSpeedMode(mode, silent)
     syncElement(UI.SpeedToggle, mode == "Custom")
     syncElement(UI.SpeedPreset, { mode })
 
-    if State.Notifications and not silent then
-        Rayfield:Notify({
-            Title = "Speed Mode",
-            Content = ("%s (%d)"):format(mode, getTargetSpeed()),
-            Duration = 3,
-        })
+    if not silent then
+        notify("Speed Mode", ("%s (%d)"):format(mode, getTargetSpeed()))
     end
     return true
 end
 
---// Apply jump power (skipped while anchored)
 local function applyJump()
     if Anchor.Active then return end
     local humanoid = getHumanoid()
@@ -181,10 +154,8 @@ end
 
 --// Infinite Jump (JumpFly) - based on the Infinite Yield "infjump" behavior
 local function setInfiniteJump(enabled)
-    if State.InfJumpConnection then
-        State.InfJumpConnection:Disconnect()
-        State.InfJumpConnection = nil
-    end
+    disconnect(State.InfJumpConnection)
+    State.InfJumpConnection = nil
 
     if enabled then
         State.InfJumpConnection = UserInputService.JumpRequest:Connect(function()
@@ -205,7 +176,6 @@ end
 ---------------------------------------------------------------------
 -- DRAG HELPERS (tap vs. drag, kept on screen)
 ---------------------------------------------------------------------
--- Nudges `target` so that `bounds` stays fully inside its ScreenGui.
 local function clampToScreen(target, bounds)
     local gui = target:FindFirstAncestorWhichIsA("ScreenGui")
     if not gui then return end
@@ -259,8 +229,8 @@ local function makeMovable(target, handle, opts)
         local function finish()
             if finished then return end
             finished = true
-            if changedConnection then changedConnection:Disconnect() end
-            if endedConnection then endedConnection:Disconnect() end
+            disconnect(changedConnection)
+            disconnect(endedConnection)
             if opts.onFinish then pcall(opts.onFinish, moved) end
             if not moved and opts.onTap then pcall(opts.onTap) end
         end
@@ -295,6 +265,12 @@ end
 ---------------------------------------------------------------------
 -- RAYFIELD TWEAKS: movable minimized button
 ---------------------------------------------------------------------
+local function isRayfieldGui(gui)
+    if not gui:IsA("ScreenGui") then return false end
+    local main = gui:FindFirstChild("Main")
+    return main ~= nil and main:FindFirstChild("Topbar") ~= nil
+end
+
 local function findRayfieldGui()
     local containers = {}
 
@@ -312,12 +288,9 @@ local function findRayfieldGui()
         local okChildren, children = pcall(function() return container:GetChildren() end)
         if okChildren then
             for _, gui in ipairs(children) do
-                if gui:IsA("ScreenGui") then
-                    local main = gui:FindFirstChild("Main")
-                    if main and main:FindFirstChild("Topbar") then
-                        if gui.Name == "Rayfield" then return gui end
-                        fallback = fallback or gui
-                    end
+                if isRayfieldGui(gui) then
+                    if gui.Name == "Rayfield" then return gui end
+                    fallback = fallback or gui
                 end
             end
         end
@@ -325,7 +298,6 @@ local function findRayfieldGui()
     return fallback
 end
 
--- Makes Rayfield's minimized "Show ..." button (appears after pressing X) draggable and scaled to PROMPT_SCALE.
 -- The button only exists on touch devices (Rayfield's own behavior).
 local function setupPromptDrag(rfGui)
     local prompt = rfGui:FindFirstChild("Prompt")
@@ -385,8 +357,6 @@ local function applyWindowScale(rfGui)
     return true
 end
 
--- Runs right after loading, before the window is created.
--- (The window scale and resize grips are applied once, after CreateWindow.)
 local rayfieldGui = findRayfieldGui()
 if rayfieldGui then
     local okPrompt, promptResult = pcall(setupPromptDrag, rayfieldGui)
@@ -402,23 +372,91 @@ end
 ---------------------------------------------------------------------
 local RESIZE_CONFIG = {
     MinSize = Vector2.new(400, 200),            -- smallest window (width, height); 400 wide keeps all tabs + sliders readable
-    HandleSize = 32,                            -- touch-friendly hit area
+    HandleSize = 32,
     GripColor = Color3.fromRGB(210, 210, 220),
-    ScreenMargin = 16,                          -- keeps the window from outgrowing the screen
+    ScreenMargin = 16,
 }
+
+local function fillWidth(object)
+    local height = object.Size.Y
+    object.Size = UDim2.new(1, 0, height.Scale, height.Offset)
+end
 
 local function setupWindowResize(rfGui)
     local main = rfGui:FindFirstChild("Main")
     if not main then return false end
-    if main:FindFirstChild("EZWINResizeRight") then return true end -- already set up
+    if main:FindFirstChild("EZWINResizeRight") then return true end
 
     local defaultSize = nil   -- Rayfield's own size, remembered on the first resize
-    local userSize = nil      -- the size the player chose
+    local userSize = nil
     local resizing = false
     local restoring = false
-    local handles = {}
+    local grip
     local applyingLayout = false
     local layoutQueued = false
+
+    local function layoutSlider(item)
+        local title = item:FindFirstChild("Title")
+        local track = item:FindFirstChild("Main")
+        if title and title:IsA("TextLabel") then
+            title.Position = UDim2.new(0, 10, 0, 5)
+            title.Size = UDim2.new(1, -20, 0, 18)
+            title.TextXAlignment = Enum.TextXAlignment.Left
+        end
+        if not (track and track:IsA("Frame")) then return end
+
+        local trackSize = track.Size
+        local progress = track:FindFirstChild("Progress")
+        local fillRatio
+
+        if progress then
+            fillRatio = progress:GetAttribute("EZWINFillRatio")
+            if fillRatio == nil then
+                fillRatio = math.clamp(progress.AbsoluteSize.X / math.max(track.AbsoluteSize.X, 1), 0, 1)
+                progress:SetAttribute("EZWINFillRatio", fillRatio)
+            end
+
+            if not progress:GetAttribute("EZWINRatioWatcher") then
+                progress:SetAttribute("EZWINRatioWatcher", true)
+                progress:GetPropertyChangedSignal("Size"):Connect(function()
+                    if not applyingLayout and track.AbsoluteSize.X > 0 then
+                        progress:SetAttribute(
+                            "EZWINFillRatio",
+                            math.clamp(progress.AbsoluteSize.X / track.AbsoluteSize.X, 0, 1)
+                        )
+                    end
+                end)
+            end
+        end
+
+        track.Position = UDim2.new(0, 10, 0, 30)
+        track.Size = UDim2.new(1, -20, trackSize.Y.Scale, trackSize.Y.Offset)
+
+        if progress and fillRatio then
+            local newTrackWidth = math.max(track.AbsoluteSize.X, 1)
+            progress.Size = UDim2.new(0, math.max(5, newTrackWidth * fillRatio), 1, 0)
+        end
+    end
+
+    local function layoutPage(page)
+        fillWidth(page)
+
+        for _, item in ipairs(page:GetChildren()) do
+            if item:IsA("Frame")
+                and item.Name ~= "SectionSpacing"
+                and item.Name ~= "SectionTitle"
+                and item.Name ~= "Placeholder" then
+
+                local itemSize = item.Size
+                item.Size = UDim2.new(1, math.min(itemSize.X.Offset, -20), itemSize.Y.Scale, itemSize.Y.Offset)
+
+                local itemMain = item:FindFirstChild("Main")
+                if item.Name == "Slider" or itemMain and itemMain:FindFirstChild("Progress") then
+                    layoutSlider(item)
+                end
+            end
+        end
+    end
 
     local function applyResponsiveLayout()
         if applyingLayout or not main.Parent then return end
@@ -429,13 +467,11 @@ local function setupWindowResize(rfGui)
         local elements = main:FindFirstChild("Elements")
 
         if topbar then
-            local topbarHeight = topbar.Size.Y
-            topbar.Size = UDim2.new(1, 0, topbarHeight.Scale, topbarHeight.Offset)
+            fillWidth(topbar)
         end
 
         if tabList then
-            local tabHeight = tabList.Size.Y
-            tabList.Size = UDim2.new(1, 0, tabHeight.Scale, tabHeight.Offset)
+            fillWidth(tabList)
             if tabList:IsA("ScrollingFrame") then
                 tabList.Active = true
                 tabList.ScrollingEnabled = true
@@ -448,71 +484,10 @@ local function setupWindowResize(rfGui)
         end
 
         if elements then
-            local elementsHeight = elements.Size.Y
-            elements.Size = UDim2.new(1, 0, elementsHeight.Scale, elementsHeight.Offset)
-
+            fillWidth(elements)
             for _, page in ipairs(elements:GetChildren()) do
                 if page:IsA("ScrollingFrame") and page.Name ~= "Template" then
-                    local pageHeight = page.Size.Y
-                    page.Size = UDim2.new(1, 0, pageHeight.Scale, pageHeight.Offset)
-
-                    for _, item in ipairs(page:GetChildren()) do
-                        if item:IsA("Frame")
-                            and item.Name ~= "SectionSpacing"
-                            and item.Name ~= "SectionTitle"
-                            and item.Name ~= "Placeholder" then
-
-                            local itemSize = item.Size
-                            item.Size = UDim2.new(1, math.min(itemSize.X.Offset, -20), itemSize.Y.Scale, itemSize.Y.Offset)
-
-                            if item.Name == "Slider" or item:FindFirstChild("Main") and item.Main:FindFirstChild("Progress") then
-                                local title = item:FindFirstChild("Title")
-                                local track = item:FindFirstChild("Main")
-                                if title and title:IsA("TextLabel") then
-                                    title.Position = UDim2.new(0, 10, 0, 5)
-                                    title.Size = UDim2.new(1, -20, 0, 18)
-                                    title.TextXAlignment = Enum.TextXAlignment.Left
-                                end
-                                if track and track:IsA("Frame") then
-                                    local trackSize = track.Size
-                                    local progress = track:FindFirstChild("Progress")
-                                    local fillRatio
-
-                                    if progress then
-                                        fillRatio = progress:GetAttribute("EZWINFillRatio")
-                                        if fillRatio == nil then
-                                            fillRatio = math.clamp(
-                                                progress.AbsoluteSize.X / math.max(track.AbsoluteSize.X, 1),
-                                                0,
-                                                1
-                                            )
-                                            progress:SetAttribute("EZWINFillRatio", fillRatio)
-                                        end
-
-                                        if not progress:GetAttribute("EZWINRatioWatcher") then
-                                            progress:SetAttribute("EZWINRatioWatcher", true)
-                                            progress:GetPropertyChangedSignal("Size"):Connect(function()
-                                                if not applyingLayout and track.AbsoluteSize.X > 0 then
-                                                    progress:SetAttribute(
-                                                        "EZWINFillRatio",
-                                                        math.clamp(progress.AbsoluteSize.X / track.AbsoluteSize.X, 0, 1)
-                                                    )
-                                                end
-                                            end)
-                                        end
-                                    end
-
-                                    track.Position = UDim2.new(0, 10, 0, 30)
-                                    track.Size = UDim2.new(1, -20, trackSize.Y.Scale, trackSize.Y.Offset)
-
-                                    if progress and fillRatio then
-                                        local newTrackWidth = math.max(track.AbsoluteSize.X, 1)
-                                        progress.Size = UDim2.new(0, math.max(5, newTrackWidth * fillRatio), 1, 0)
-                                    end
-                                end
-                            end
-                        end
-                    end
+                    layoutPage(page)
                 end
             end
         end
@@ -525,13 +500,10 @@ local function setupWindowResize(rfGui)
         layoutQueued = true
         task.defer(function()
             layoutQueued = false
-            if main.Parent then
-                applyResponsiveLayout()
-            end
+            applyResponsiveLayout()
         end)
     end
 
-    -- The window's own scale (WINDOW_SCALE). Position shifts use this one only.
     local function windowScaleValue()
         local windowScale = main:FindFirstChild("EZWINWindowScale")
         return windowScale and windowScale.Scale or 1
@@ -552,11 +524,9 @@ local function setupWindowResize(rfGui)
         return Vector2.new(abs.X, abs.Y)
     end
 
-    -- Handles only show while the window is actually open (not minimized / hidden)
-    local function updateHandles()
-        local show = main.Visible and main.AbsoluteSize.Y > 120
-        for _, handle in ipairs(handles) do
-            handle.Visible = show
+    local function updateGrip()
+        if grip then
+            grip.Visible = main.Visible and main.AbsoluteSize.Y > 120
         end
     end
 
@@ -577,10 +547,10 @@ local function setupWindowResize(rfGui)
         end
     end
 
-    local function createHandle(name)
+    local function createGrip()
         local size = RESIZE_CONFIG.HandleSize
         local handle = Instance.new("Frame")
-        handle.Name = name
+        handle.Name = "EZWINResizeRight"
         handle.AnchorPoint = Vector2.new(1, 1)
         handle.Position = UDim2.new(1, -4, 1, -4)
         handle.Size = UDim2.fromOffset(size, size)
@@ -590,7 +560,7 @@ local function setupWindowResize(rfGui)
         handle.ZIndex = 100
         handle.Parent = main
         addGrip(handle)
-        table.insert(handles, handle)
+        grip = handle
 
         handle.InputBegan:Connect(function(input)
             local inputType = input.UserInputType
@@ -617,9 +587,9 @@ local function setupWindowResize(rfGui)
                 if finished then return end
                 finished = true
                 resizing = false
-                if changedConnection then changedConnection:Disconnect() end
-                if endedConnection then endedConnection:Disconnect() end
-                if inputEndedConnection then inputEndedConnection:Disconnect() end
+                disconnect(changedConnection)
+                disconnect(endedConnection)
+                disconnect(inputEndedConnection)
                 userSize = main.Size
             end
 
@@ -660,11 +630,9 @@ local function setupWindowResize(rfGui)
             end)
         end)
 
-        return handle
     end
 
-    -- Bottom-right resize grip only
-    createHandle("EZWINResizeRight")
+    createGrip()
 
     local topbar = main:FindFirstChild("Topbar")
     if topbar then
@@ -677,7 +645,7 @@ local function setupWindowResize(rfGui)
     -- Rayfield tweens the window back to its default size when you minimize/reopen it.
     -- When that happens, put the player's chosen size back.
     main:GetPropertyChangedSignal("Size"):Connect(function()
-        updateHandles()
+        updateGrip()
         queueResponsiveLayout()
         if resizing or restoring or not userSize or not defaultSize then return end
 
@@ -697,8 +665,8 @@ local function setupWindowResize(rfGui)
             tween:Play()
         end
     end)
-    main:GetPropertyChangedSignal("Visible"):Connect(updateHandles)
-    updateHandles()
+    main:GetPropertyChangedSignal("Visible"):Connect(updateGrip)
+    updateGrip()
 
     return true
 end
@@ -759,9 +727,7 @@ local function espDetach(player)
     local entry = ESP.Entries[player]
     if not entry then return end
     ESP.Entries[player] = nil
-    for _, connection in ipairs(entry.connections) do
-        connection:Disconnect()
-    end
+    disconnectAll(entry.connections)
     if entry.gui then
         entry.gui:Destroy()
         entry.highlight:Destroy()
@@ -845,9 +811,7 @@ local function espOnPlayerRemoving(player)
     local connections = ESP.PlayerConnections[player]
     if connections then
         ESP.PlayerConnections[player] = nil
-        for _, connection in ipairs(connections) do
-            connection:Disconnect()
-        end
+        disconnectAll(connections)
     end
 end
 
@@ -899,18 +863,13 @@ local function stopESP()
     if not ESP.Running then return end
     ESP.Running = false
 
-    if ESP.RenderConnection then ESP.RenderConnection:Disconnect() ESP.RenderConnection = nil end
-    if ESP.AddedConnection then ESP.AddedConnection:Disconnect() ESP.AddedConnection = nil end
-    if ESP.RemovingConnection then ESP.RemovingConnection:Disconnect() ESP.RemovingConnection = nil end
+    disconnect(ESP.RenderConnection)
+    disconnect(ESP.AddedConnection)
+    disconnect(ESP.RemovingConnection)
+    ESP.RenderConnection, ESP.AddedConnection, ESP.RemovingConnection = nil, nil, nil
 
-    for player in pairs(ESP.Entries) do
-        espDetach(player)
-    end
-    for player, connections in pairs(ESP.PlayerConnections) do
-        for _, connection in ipairs(connections) do
-            connection:Disconnect()
-        end
-        ESP.PlayerConnections[player] = nil
+    for player in pairs(ESP.PlayerConnections) do
+        espOnPlayerRemoving(player)
     end
     table.clear(ESP.Ranked)
 end
@@ -920,7 +879,7 @@ end
 ---------------------------------------------------------------------
 local ANCHOR_CONFIG = {
     ButtonSize = UDim2.fromOffset(90, 42),
-    ButtonPosition = UDim2.new(1, -24, 1, -170),   -- default: lower right, above the jump button
+    ButtonPosition = UDim2.new(1, -24, 1, -170),
     ColorOff = Color3.fromRGB(55, 58, 70),
     ColorOn = Color3.fromRGB(0, 170, 110),
     ColorDisabled = Color3.fromRGB(35, 36, 42),
@@ -944,47 +903,151 @@ local function zeroVelocity(root)
     root.AssemblyAngularVelocity = Vector3.zero
 end
 
--- Refresh the on-screen button (if it exists)
-local function updateAnchorUI()
-    local _, humanoid = getCharacterParts()
-    Anchor.ButtonReady = humanoid ~= nil and humanoid.Health > 0
+-- Movable on-screen toggle button. cfg: GuiName, Label, Position, IsActive(), OnTap().
+-- Returns { SetVisible(visible), Refresh() }; the dragged position is remembered for the session.
+local function createButtonSlot(cfg)
+    local slot = {}
+    local gui, button
+    local position = cfg.Position
 
-    local button = Anchor.Button
-    if not button then return end
-    if not Anchor.ButtonReady then
-        button.BackgroundColor3 = ANCHOR_CONFIG.ColorDisabled
-        button.Text = "Anchor: OFF"
-        return
+    function slot.Refresh()
+        if not button then return end
+        local _, humanoid = getCharacterParts()
+        local ready = isAlive(humanoid)
+        local active = ready and cfg.IsActive()
+        button.Text = cfg.Label .. (active and ": ON" or ": OFF")
+        TweenService:Create(button, TweenInfo.new(0.15), {
+            BackgroundColor3 = not ready and ANCHOR_CONFIG.ColorDisabled
+                or (active and ANCHOR_CONFIG.ColorOn or ANCHOR_CONFIG.ColorOff),
+        }):Play()
     end
-    button.Text = Anchor.Active and "Anchor: ON" or "Anchor: OFF"
-    TweenService:Create(button, TweenInfo.new(0.15), {
-        BackgroundColor3 = Anchor.Active and ANCHOR_CONFIG.ColorOn or ANCHOR_CONFIG.ColorOff,
-    }):Play()
+
+    function slot.SetVisible(visible)
+        if not visible then
+            if gui then gui:Destroy() end
+            gui, button = nil, nil
+            return
+        end
+        if gui then return end
+
+        local playerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
+        if not playerGui then
+            warn("[EZ WIN] PlayerGui not found; cannot create " .. cfg.Label .. " button.")
+            return
+        end
+
+        local old = playerGui:FindFirstChild(cfg.GuiName)
+        if old then old:Destroy() end
+
+        gui = Instance.new("ScreenGui")
+        gui.Name = cfg.GuiName
+        gui.ResetOnSpawn = false
+        gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        gui.DisplayOrder = 10
+        gui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
+        gui.Parent = playerGui
+
+        button = Instance.new("TextButton")
+        button.Name = cfg.GuiName .. "Button"
+        button.AnchorPoint = Vector2.new(1, 1)
+        button.Position = position
+        button.Size = ANCHOR_CONFIG.ButtonSize
+        button.BackgroundColor3 = ANCHOR_CONFIG.ColorOff
+        button.AutoButtonColor = false
+        button.Font = Enum.Font.GothamBold
+        button.TextSize = 14
+        button.TextColor3 = Color3.new(1, 1, 1)
+        button.Text = cfg.Label .. ": OFF"
+        button.Parent = gui
+
+        local corner = Instance.new("UICorner")
+        corner.CornerRadius = UDim.new(0, 10)
+        corner.Parent = button
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Thickness = 2
+        stroke.Color = Color3.new(1, 1, 1)
+        stroke.Transparency = 0.6
+        stroke.Parent = button
+
+        local scale = Instance.new("UIScale")
+        scale.Parent = button
+
+        makeMovable(button, button, {
+            onFinish = function(moved)
+                if moved then position = button.Position end
+            end,
+            onTap = function()
+                scale.Scale = 0.92
+                TweenService:Create(scale, TweenInfo.new(0.12, Enum.EasingStyle.Back), { Scale = 1 }):Play()
+                cfg.OnTap()
+            end,
+        })
+
+        slot.Refresh()
+    end
+
+    return slot
 end
 
--- Drops all lock bookkeeping. Shared by unanchor, death and respawn.
+-- Runs cfg.OnSpawn(character) for the current character and every respawn. Once the Humanoid
+-- (and the root part, with cfg.NeedsRoot) exists, cfg.OnReady() runs and cfg.OnDeath(root) is
+-- connected to its death. cfg.OnRespawned() runs after each respawn's setup.
+-- Returns a function that stops watching.
+local function watchCharacter(cfg)
+    local died
+
+    local function setup(character)
+        disconnect(died)
+        died = nil
+        cfg.OnSpawn(character)
+
+        local humanoid = character:WaitForChild("Humanoid", 10)
+        local root = cfg.NeedsRoot and character:WaitForChild("HumanoidRootPart", 10)
+        if not humanoid or cfg.NeedsRoot and not root or LocalPlayer.Character ~= character then
+            return
+        end
+
+        died = humanoid.Died:Connect(function()
+            cfg.OnDeath(root)
+        end)
+        if cfg.OnReady then cfg.OnReady() end
+    end
+
+    local added = LocalPlayer.CharacterAdded:Connect(function(character)
+        setup(character)
+        if cfg.OnRespawned then cfg.OnRespawned() end
+    end)
+    if LocalPlayer.Character then
+        task.spawn(setup, LocalPlayer.Character)
+    end
+
+    return function()
+        added:Disconnect()
+        disconnect(died)
+        died = nil
+    end
+end
+
 local function clearAnchorLock()
     Anchor.Active = false
     Anchor.Saved = nil
-    if Anchor.Heartbeat then
-        Anchor.Heartbeat:Disconnect()
-        Anchor.Heartbeat = nil
-    end
+    disconnect(Anchor.Heartbeat)
+    Anchor.Heartbeat = nil
 end
 
 local function setAnchored(enabled)
-    if enabled == Anchor.Active then return end -- already in that state (also prevents loops)
+    if enabled == Anchor.Active then return end
 
     local _, humanoid, root = getCharacterParts()
 
     if enabled then
-        if not humanoid or not root or humanoid.Health <= 0 then
-            updateAnchorUI()
+        if not root or not isAlive(humanoid) then
+            Anchor.Button.Refresh()
             syncElement(Anchor.Toggle, false)
             return
         end
 
-        -- Saved once per lock so repeated "ON" calls never overwrite them with zeros
         Anchor.Saved = {
             WalkSpeed = humanoid.WalkSpeed,
             JumpPower = humanoid.JumpPower,
@@ -1000,8 +1063,6 @@ local function setAnchored(enabled)
         zeroVelocity(root)      -- zero BEFORE anchoring so no residual momentum remains
         root.Anchored = true
 
-        -- Keep the character locked even if something else unanchors/pushes it
-        if Anchor.Heartbeat then Anchor.Heartbeat:Disconnect() end
         Anchor.Heartbeat = RunService.Heartbeat:Connect(function()
             local _, h, r = getCharacterParts()
             if not h or not r then return end
@@ -1025,127 +1086,51 @@ local function setAnchored(enabled)
         -- The hub's current speed/jump win over the stale values saved before the lock
         if State.SpeedMode ~= "Default" then applySpeed() end
         if State.JumpEnabled then applyJump() end
+
+        if Anchor.OnRelease then Anchor.OnRelease() end
     end
 
-    updateAnchorUI()
+    Anchor.Button.Refresh()
     syncElement(Anchor.Toggle, enabled)
 end
 
--- On-screen button (draggable; tap toggles, drag moves)
-local function destroyAnchorButton()
-    if Anchor.Gui then
-        Anchor.Gui:Destroy()
-    end
-    Anchor.Gui, Anchor.Button, Anchor.Scale = nil, nil, nil
-end
-
-local function createAnchorButton()
-    if Anchor.Gui then return end
-
-    local playerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-    if not playerGui then
-        warn("[EZ WIN] PlayerGui not found; cannot create anchor button.")
-        return
-    end
-
-    local old = playerGui:FindFirstChild("EZWINAnchorGui")
-    if old then old:Destroy() end
-
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "EZWINAnchorGui"
-    gui.ResetOnSpawn = false
-    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    gui.DisplayOrder = 10
-    gui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
-    gui.Parent = playerGui
-
-    local button = Instance.new("TextButton")
-    button.Name = "AnchorButton"
-    button.AnchorPoint = Vector2.new(1, 1)
-    button.Position = Anchor.Pos or ANCHOR_CONFIG.ButtonPosition
-    button.Size = ANCHOR_CONFIG.ButtonSize
-    button.BackgroundColor3 = ANCHOR_CONFIG.ColorDisabled
-    button.AutoButtonColor = false
-    button.Font = Enum.Font.GothamBold
-    button.TextSize = 14
-    button.TextColor3 = Color3.new(1, 1, 1)
-    button.Text = "Anchor: OFF"
-    button.Parent = gui
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 10)
-    corner.Parent = button
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Thickness = 2
-    stroke.Color = Color3.new(1, 1, 1)
-    stroke.Transparency = 0.6
-    stroke.Parent = button
-
-    local scale = Instance.new("UIScale") -- tap-feedback animation
-    scale.Parent = button
-
-    Anchor.Gui, Anchor.Button, Anchor.Scale = gui, button, scale
-
-    makeMovable(button, button, {
-        onFinish = function(moved)
-            if moved then
-                Anchor.Pos = button.Position -- remember where it was dropped
-            end
-        end,
-        onTap = function()
-            if not Anchor.ButtonReady then return end
-            scale.Scale = 0.92
-            TweenService:Create(scale, TweenInfo.new(0.12, Enum.EasingStyle.Back), { Scale = 1 }):Play()
+Anchor.Button = createButtonSlot({
+    GuiName = "EZWINAnchorGui",
+    Label = "Anchor",
+    Position = ANCHOR_CONFIG.ButtonPosition,
+    IsActive = function() return Anchor.Active end,
+    OnTap = function()
+        local _, humanoid = getCharacterParts()
+        if isAlive(humanoid) then
             setAnchored(not Anchor.Active)
-        end,
-    })
+        end
+    end,
+})
 
-    updateAnchorUI()
-end
-
--- Respawn handling: a fresh character is always unanchored
-local function onAnchorCharacterAdded(character)
-    clearAnchorLock()
-    if Anchor.Died then
-        Anchor.Died:Disconnect()
-        Anchor.Died = nil
-    end
-    syncElement(Anchor.Toggle, false)
-    updateAnchorUI()
-
-    local humanoid = character:WaitForChild("Humanoid", 10)
-    local root = character:WaitForChild("HumanoidRootPart", 10)
-    if not humanoid or not root or LocalPlayer.Character ~= character then
-        return
-    end
-
-    -- If the player dies while anchored, release the lock cleanly
-    Anchor.Died = humanoid.Died:Connect(function()
+local stopAnchorWatch = watchCharacter({
+    NeedsRoot = true,
+    OnSpawn = function()
+        clearAnchorLock()
+        syncElement(Anchor.Toggle, false)
+        Anchor.Button.Refresh()
+    end,
+    OnReady = Anchor.Button.Refresh,
+    OnDeath = function(root)
         clearAnchorLock()
         if root:IsA("BasePart") then
             root.Anchored = false
         end
         syncElement(Anchor.Toggle, false)
-        updateAnchorUI()
-    end)
-
-    updateAnchorUI()
-end
-
-table.insert(Connections, LocalPlayer.CharacterAdded:Connect(function(character)
-    onAnchorCharacterAdded(character)
-    -- Re-apply speed/jump after respawn
-    task.wait(0.5)
-    pcall(function()
-        if State.SpeedMode ~= "Default" then applySpeed() end
-        if State.JumpEnabled then applyJump() end
-    end)
-end))
-
-if LocalPlayer.Character then
-    task.spawn(onAnchorCharacterAdded, LocalPlayer.Character)
-end
+        Anchor.Button.Refresh()
+    end,
+    OnRespawned = function()
+        task.wait(0.5)
+        pcall(function()
+            if State.SpeedMode ~= "Default" then applySpeed() end
+            if State.JumpEnabled then applyJump() end
+        end)
+    end,
+})
 
 ---------------------------------------------------------------------
 -- SCRIPT 3: SURVIVE (TP to one random other player and back)
@@ -1157,9 +1142,7 @@ local function tpToOtherPlayer()
 
     local character, _, root = getCharacterParts()
     if not root then
-        if State.Notifications then
-            Rayfield:Notify({ Title = "Survive", Content = "Your character isn't available.", Duration = 3 })
-        end
+        notify("Survive", "Your character isn't available.")
         return
     end
 
@@ -1167,14 +1150,12 @@ local function tpToOtherPlayer()
     for _, player in ipairs(Players:GetPlayers()) do
         local targetCharacter = player.Character
         local targetHumanoid = targetCharacter and targetCharacter:FindFirstChildOfClass("Humanoid")
-        if player ~= LocalPlayer and rootOf(targetCharacter) and targetHumanoid and targetHumanoid.Health > 0 then
+        if player ~= LocalPlayer and rootOf(targetCharacter) and isAlive(targetHumanoid) then
             table.insert(targets, targetCharacter)
         end
     end
     if #targets == 0 then
-        if State.Notifications then
-            Rayfield:Notify({ Title = "Survive", Content = "No other player to teleport to.", Duration = 3 })
-        end
+        notify("Survive", "No other player to teleport to.")
         return
     end
 
@@ -1203,7 +1184,7 @@ local function tpToOtherPlayer()
     -- Always returns, even if the teleport above failed; skipped only if we died or respawned
     pcall(function()
         local currentCharacter, humanoid, currentRoot = getCharacterParts()
-        if currentCharacter ~= character or humanoid.Health <= 0 then return end
+        if currentCharacter ~= character or not isAlive(humanoid) then return end
         currentRoot.CFrame = originalCFrame
         zeroVelocity(currentRoot)
         if wasAnchored then
@@ -1215,129 +1196,39 @@ local function tpToOtherPlayer()
 end
 
 ---------------------------------------------------------------------
--- SHARED: movable on-screen toggle button (used by Float and Aim)
--- cfg: GuiName, Label, Position, OnTap(), OnMoved(position)
--- Returns { Gui, Button, Refresh(active) } or nil when PlayerGui is missing
----------------------------------------------------------------------
-local function createToggleButton(cfg)
-    local playerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
-    if not playerGui then
-        warn("[EZ WIN] PlayerGui not found; cannot create " .. cfg.Label .. " button.")
-        return nil
-    end
-
-    local old = playerGui:FindFirstChild(cfg.GuiName)
-    if old then old:Destroy() end
-
-    local gui = Instance.new("ScreenGui")
-    gui.Name = cfg.GuiName
-    gui.ResetOnSpawn = false
-    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-    gui.DisplayOrder = 10
-    gui.ScreenInsets = Enum.ScreenInsets.DeviceSafeInsets
-    gui.Parent = playerGui
-
-    local button = Instance.new("TextButton")
-    button.Name = cfg.GuiName .. "Button"
-    button.AnchorPoint = Vector2.new(1, 1)
-    button.Position = cfg.Position
-    button.Size = ANCHOR_CONFIG.ButtonSize
-    button.BackgroundColor3 = ANCHOR_CONFIG.ColorOff
-    button.AutoButtonColor = false
-    button.Font = Enum.Font.GothamBold
-    button.TextSize = 14
-    button.TextColor3 = Color3.new(1, 1, 1)
-    button.Text = cfg.Label .. ": OFF"
-    button.Parent = gui
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 10)
-    corner.Parent = button
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Thickness = 2
-    stroke.Color = Color3.new(1, 1, 1)
-    stroke.Transparency = 0.6
-    stroke.Parent = button
-
-    local scale = Instance.new("UIScale")
-    scale.Parent = button
-
-    local handle = { Gui = gui, Button = button }
-
-    function handle.Refresh(active)
-        local _, humanoid = getCharacterParts()
-        local ready = humanoid ~= nil and humanoid.Health > 0
-        active = active and ready
-        button.Text = cfg.Label .. (active and ": ON" or ": OFF")
-        TweenService:Create(button, TweenInfo.new(0.15), {
-            BackgroundColor3 = not ready and ANCHOR_CONFIG.ColorDisabled
-                or (active and ANCHOR_CONFIG.ColorOn or ANCHOR_CONFIG.ColorOff),
-        }):Play()
-    end
-
-    makeMovable(button, button, {
-        onFinish = function(moved)
-            if moved and cfg.OnMoved then cfg.OnMoved(button.Position) end
-        end,
-        onTap = function()
-            scale.Scale = 0.92
-            TweenService:Create(scale, TweenInfo.new(0.12, Enum.EasingStyle.Back), { Scale = 1 }):Play()
-            cfg.OnTap()
-        end,
-    })
-
-    return handle
-end
-
----------------------------------------------------------------------
 -- SCRIPT 4: FLOAT (teleport up + hover, survive tab)
 ---------------------------------------------------------------------
 local FLOAT_CONFIG = {
-    Height = 170,                                    -- studs teleported straight up
-    ButtonPosition = UDim2.new(1, -24, 1, -222),     -- stacked above the Anchor button
+    Height = 170,
+    ButtonPosition = UDim2.new(1, -24, 1, -222),
     GroundRayLength = 5000,
 }
 
 local Float = {
     Active = false,
-    Origin = nil,        -- CFrame before the teleport (fallback when no ground is found)
+    Origin = nil,
     Attachment = nil,
-    Force = nil,         -- VectorForce that cancels gravity
+    Force = nil,
     Heartbeat = nil,
-    Died = nil,
-    Toggle = nil,        -- Rayfield toggle
-    Button = nil,        -- on-screen button handle
-    ButtonPos = nil,
+    Toggle = nil,
+    Button = nil,
 }
 
-local function refreshFloatButton()
-    if Float.Button then Float.Button.Refresh(Float.Active) end
-end
-
-local function notifyFloat(message)
-    if State.Notifications then
-        Rayfield:Notify({ Title = "Float", Content = message, Duration = 3 })
-    end
-end
-
 local function releaseFloatPhysics()
-    if Float.Heartbeat then Float.Heartbeat:Disconnect() end
+    disconnect(Float.Heartbeat)
     if Float.Force then Float.Force:Destroy() end
     if Float.Attachment then Float.Attachment:Destroy() end
     Float.Heartbeat, Float.Force, Float.Attachment = nil, nil, nil
 end
 
--- Character state is gone or dead: drop all bookkeeping, nothing to restore
 local function resetFloat()
     releaseFloatPhysics()
     Float.Active = false
     Float.Origin = nil
     syncElement(Float.Toggle, false)
-    refreshFloatButton()
+    Float.Button.Refresh()
 end
 
--- Position directly above the ground under the character (falls back to the saved origin)
 local function findGroundCFrame(character, humanoid, root, origin)
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
@@ -1357,13 +1248,13 @@ local function setFloat(enabled)
     local character, humanoid, root = getCharacterParts()
 
     if enabled then
-        if not humanoid or humanoid.Health <= 0 then
-            notifyFloat("Your character isn't available.")
+        if not isAlive(humanoid) then
+            notify("Float", "Your character isn't available.")
             syncElement(Float.Toggle, false)
             return
         end
         if Anchor.Active then
-            notifyFloat("Turn off Anchor first.")
+            notify("Float", "Turn off Anchor first.")
             syncElement(Float.Toggle, false)
             return
         end
@@ -1400,79 +1291,64 @@ local function setFloat(enabled)
         releaseFloatPhysics()
         Float.Active = false
         Float.Origin = nil
-        if root and humanoid and humanoid.Health > 0 and origin then
+        -- Anchored: stay where we are; only drop to the ground when Anchor is not holding us
+        if root and isAlive(humanoid) and origin and not Anchor.Active then
             root.CFrame = findGroundCFrame(character, humanoid, root, origin)
             zeroVelocity(root)
         end
     end
 
     syncElement(Float.Toggle, enabled)
-    refreshFloatButton()
+    Float.Button.Refresh()
 end
 
-local function destroyFloatButton()
-    if Float.Button then Float.Button.Gui:Destroy() end
-    Float.Button = nil
-end
-
-local function createFloatButton()
-    if Float.Button then return end
-    Float.Button = createToggleButton({
-        GuiName = "EZWINFloatGui",
-        Label = "Float",
-        Position = Float.ButtonPos or FLOAT_CONFIG.ButtonPosition,
-        OnMoved = function(position) Float.ButtonPos = position end,
-        OnTap = function() setFloat(not Float.Active) end,
-    })
-    refreshFloatButton()
-end
-
-local function onFloatCharacterAdded(character)
-    resetFloat()
-    if Float.Died then
-        Float.Died:Disconnect()
-        Float.Died = nil
-    end
-    local humanoid = character:WaitForChild("Humanoid", 10)
-    if humanoid and LocalPlayer.Character == character then
-        Float.Died = humanoid.Died:Connect(resetFloat)
+-- Turning Anchor off while Float is on turns Float off too (skipped during the Survive teleport's temporary unanchor)
+Anchor.OnRelease = function()
+    if Float.Active and not tpRunning then
+        setFloat(false)
     end
 end
 
-table.insert(Connections, LocalPlayer.CharacterAdded:Connect(onFloatCharacterAdded))
-if LocalPlayer.Character then
-    task.spawn(onFloatCharacterAdded, LocalPlayer.Character)
-end
+Float.Button = createButtonSlot({
+    GuiName = "EZWINFloatGui",
+    Label = "Float",
+    Position = FLOAT_CONFIG.ButtonPosition,
+    IsActive = function() return Float.Active end,
+    OnTap = function() setFloat(not Float.Active) end,
+})
+
+local stopFloatWatch = watchCharacter({
+    OnSpawn = resetFloat,
+    OnDeath = resetFloat,
+})
 
 ---------------------------------------------------------------------
 -- SCRIPT 5: MOBILE AIMBOT (scripts tab)
 ---------------------------------------------------------------------
 local AIM_CONFIG = {
-    ButtonPosition = UDim2.new(1, -24, 1, -274),   -- stacked above the Float button
+    ButtonPosition = UDim2.new(1, -24, 1, -274),
     ScanInterval = 0.1,                            -- target scan rate (10 Hz); camera runs every frame
-    DistanceWeight = 0.05,                         -- stud distance tie-breaker vs. screen distance
+    DistanceWeight = 0.05,
     BindName = "EZWINAim",
 }
 
 local Aim = {
-    Armed = false,       -- on-screen button + FOV circle exist
-    Active = false,      -- camera is being pulled toward targets
+    Armed = false,
+    Active = false,
     TargetPlayer = nil,
     TargetPart = nil,
     Elapsed = 0,
     Button = nil,
-    ButtonPos = nil,
     CircleGui = nil,
     Circle = nil,
-    Died = nil,
     Toggle = nil,
     RayParams = RaycastParams.new(),
     Settings = {
         AimPart = "Head",
         Priority = "Closest", -- "Closest" | "Lowest HP" | "Highest HP" | "Random"
         Smoothing = 0.25,    -- 0.05 (slow) .. 1 (instant)
-        FOV = 150,           -- screen radius in pixels
-        MaxDistance = 500,   -- studs
+        FOV = 150,
+        MaxDistance = 500,
         TeamCheck = true,
         WallCheck = true,
         ShowCircle = true,
@@ -1482,10 +1358,6 @@ Aim.RayParams.FilterType = Enum.RaycastFilterType.Exclude
 Aim.RayParams.IgnoreWater = true
 Aim.RayParams.RespectCanCollide = true
 
-local function refreshAimButton()
-    if Aim.Button then Aim.Button.Refresh(Aim.Active) end
-end
-
 -- Returns (score, aimPart, health) when the player is a valid target right now, lower score = better
 local function aimEvaluate(player, camera, center)
     local settings = Aim.Settings
@@ -1494,7 +1366,7 @@ local function aimEvaluate(player, camera, center)
 
     local character = player.Character
     local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    if not humanoid or humanoid.Health <= 0 then return nil end
+    if not isAlive(humanoid) then return nil end
 
     local part = character:FindFirstChild(settings.AimPart) or character:FindFirstChild("HumanoidRootPart")
     if not part then return nil end
@@ -1521,7 +1393,6 @@ local function aimAccepts(camera, part)
     return not Aim.Settings.WallCheck or aimIsVisible(camera, part)
 end
 
--- Orders candidates by the selected priority (screen/stud score breaks ties)
 local function sortAimCandidates(candidates)
     local priority = Aim.Settings.Priority
     if priority == "Random" then
@@ -1544,7 +1415,6 @@ local function sortAimCandidates(candidates)
     end
 end
 
--- Keeps the current lock while it stays valid, otherwise picks the best visible target
 local function aimScan(camera)
     Aim.RayParams.FilterDescendantsInstances = { LocalPlayer.Character }
     local viewport = camera.ViewportSize
@@ -1614,7 +1484,7 @@ local function setAimActive(enabled)
         Aim.TargetPlayer, Aim.TargetPart = nil, nil
     end
 
-    refreshAimButton()
+    Aim.Button.Refresh()
 end
 
 local function updateAimCircle()
@@ -1663,22 +1533,13 @@ local function destroyAimCircle()
     Aim.CircleGui, Aim.Circle = nil, nil
 end
 
-local function destroyAimButton()
-    if Aim.Button then Aim.Button.Gui:Destroy() end
-    Aim.Button = nil
-end
-
-local function createAimButton()
-    if Aim.Button then return end
-    Aim.Button = createToggleButton({
-        GuiName = "EZWINAimGui",
-        Label = "Aim",
-        Position = Aim.ButtonPos or AIM_CONFIG.ButtonPosition,
-        OnMoved = function(position) Aim.ButtonPos = position end,
-        OnTap = function() setAimActive(not Aim.Active) end,
-    })
-    refreshAimButton()
-end
+Aim.Button = createButtonSlot({
+    GuiName = "EZWINAimGui",
+    Label = "Aim",
+    Position = AIM_CONFIG.ButtonPosition,
+    IsActive = function() return Aim.Active end,
+    OnTap = function() setAimActive(not Aim.Active) end,
+})
 
 -- "Armed" = the on-screen Aim button and FOV circle exist; tapping the button starts/stops aiming
 local function setAimArmed(enabled)
@@ -1687,32 +1548,18 @@ local function setAimArmed(enabled)
 
     if enabled then
         createAimCircle()
-        createAimButton()
+        Aim.Button.SetVisible(true)
     else
         setAimActive(false)
-        destroyAimButton()
+        Aim.Button.SetVisible(false)
         destroyAimCircle()
     end
 end
 
-local function onAimCharacterAdded(character)
-    setAimActive(false)
-    if Aim.Died then
-        Aim.Died:Disconnect()
-        Aim.Died = nil
-    end
-    local humanoid = character:WaitForChild("Humanoid", 10)
-    if humanoid and LocalPlayer.Character == character then
-        Aim.Died = humanoid.Died:Connect(function()
-            setAimActive(false)
-        end)
-    end
-end
-
-table.insert(Connections, LocalPlayer.CharacterAdded:Connect(onAimCharacterAdded))
-if LocalPlayer.Character then
-    task.spawn(onAimCharacterAdded, LocalPlayer.Character)
-end
+local stopAimWatch = watchCharacter({
+    OnSpawn = function() setAimActive(false) end,
+    OnDeath = function() setAimActive(false) end,
+})
 
 ---------------------------------------------------------------------
 -- UNLOAD (restores everything the hub changed)
@@ -1721,30 +1568,17 @@ local function unloadAll()
     setInfiniteJump(false)
     stopESP()
     setAnchored(false)
-    destroyAnchorButton()
-    if Anchor.Died then
-        Anchor.Died:Disconnect()
-        Anchor.Died = nil
-    end
+    Anchor.Button.SetVisible(false)
+    stopAnchorWatch()
     setFloat(false)
-    destroyFloatButton()
-    if Float.Died then
-        Float.Died:Disconnect()
-        Float.Died = nil
-    end
+    Float.Button.SetVisible(false)
+    stopFloatWatch()
     setAimArmed(false)
-    if Aim.Died then
-        Aim.Died:Disconnect()
-        Aim.Died = nil
-    end
+    stopAimWatch()
     State.SpeedMode = "Default"
     State.JumpEnabled = false
     applySpeed()
     applyJump()
-    for _, connection in ipairs(Connections) do
-        connection:Disconnect()
-    end
-    table.clear(Connections)
 end
 
 ---------------------------------------------------------------------
@@ -1752,42 +1586,41 @@ end
 ---------------------------------------------------------------------
 local Window = Rayfield:CreateWindow({
     Name = HUB_NAME,
-    Icon = 0,                              -- 0 = no icon, or a Lucide icon name / asset ID
+    Icon = 0,
     LoadingTitle = HUB_NAME,
     LoadingSubtitle = HUB_CREDIT,
-    ShowText = HUB_NAME,                   -- Text on the minimized "Show ..." button
-    Theme = "Default",                     -- "Default", "Ocean", "AmberGlow", "Light", etc.
+    ShowText = HUB_NAME,
+    Theme = "Default",
 
-    ToggleUIKeybind = "K",                 -- Press K to show/hide the UI
+    ToggleUIKeybind = "K",
 
     DisableRayfieldPrompts = false,
     DisableBuildWarnings = false,
 
     ConfigurationSaving = {
         Enabled = true,
-        FolderName = "EZWIN",              -- Custom folder name (nil = root workspace)
+        FolderName = "EZWIN",
         FileName = "EZWINConfig",
     },
 
     Discord = {
-        Enabled = false,                   -- Set true and add an invite code to use
-        Invite = "noinvitelink",           -- The part after discord.gg/
+        Enabled = false,
+        Invite = "noinvitelink",
         RememberJoins = true,
     },
 
-    KeySystem = false,                     -- Set true to require a key
+    KeySystem = false,
     KeySettings = {
         Title = "EZ WIN | Key",
         Subtitle = "Key System",
         Note = "Enter the key to continue.",
         FileName = "EZWINKey",
         SaveKey = true,
-        GrabKeyFromSite = false,           -- If true, Key below should be a raw URL
+        GrabKeyFromSite = false,
         Key = { "ChangeThisKey" },
     },
 })
 
--- Add the resize grips now that the window exists
 do
     local rfGui = findRayfieldGui() or rayfieldGui
     if rfGui then
@@ -1808,9 +1641,6 @@ local MainTab = Window:CreateTab("Main", "home")
 
 MainTab:CreateSection("Speed")
 
--- The toggle and the dropdown are two views of State.SpeedMode ("Custom" <-> toggle ON).
--- Both callbacks go through setSpeedMode(), which is a no-op when nothing changes,
--- so syncing one from the other (or loading a saved config in any order) never loops.
 UI.SpeedToggle = MainTab:CreateToggle({
     Name = "Enable Custom Walk Speed",
     CurrentValue = false,
@@ -1883,25 +1713,17 @@ MainTab:CreateToggle({
     Flag = "InfJumpToggle",
     Callback = safe("InfJumpToggle", function(Value)
         setInfiniteJump(Value)
-        if State.Notifications then
-            Rayfield:Notify({
-                Title = "JumpFly",
-                Content = Value and "Enabled - keep pressing jump in mid-air." or "Disabled.",
-                Duration = 3,
-            })
-        end
+        notify("JumpFly", Value and "Enabled - keep pressing jump in mid-air." or "Disabled.")
     end),
 })
 
 MainTab:CreateButton({
     Name = "Reset Speed & Jump",
     Callback = safe("ResetButton", function()
-        -- Speed: back to "Default" (this also switches the toggle and dropdown)
         setSpeedMode("Default", true)
-        State.SpeedValue = State.DefaultSpeed
-        syncElement(UI.SpeedSlider, State.DefaultSpeed)
+        State.SpeedValue = Presets.Default
+        syncElement(UI.SpeedSlider, Presets.Default)
 
-        -- Jump
         State.JumpEnabled = false
         State.JumpValue = State.DefaultJump
         syncElement(UI.JumpToggle, false)
@@ -1909,13 +1731,7 @@ MainTab:CreateButton({
 
         applySpeed()
         applyJump()
-        if State.Notifications then
-            Rayfield:Notify({
-                Title = "Reset",
-                Content = "Speed and jump restored to default.",
-                Duration = 3,
-            })
-        end
+        notify("Reset", "Speed and jump restored to default.")
     end),
 })
 
@@ -1945,22 +1761,14 @@ ScriptsTab:CreateSection("Anchor Character")
 Anchor.Toggle = ScriptsTab:CreateToggle({
     Name = "Anchor Character",
     CurrentValue = false,
-    Callback = safe("AnchorToggle", function(Value)
-        setAnchored(Value)
-    end),
+    Callback = safe("AnchorToggle", setAnchored),
 })
 
 ScriptsTab:CreateToggle({
     Name = "Show On-Screen Anchor Button (movable)",
     CurrentValue = false,
     Flag = "AnchorButtonToggle",
-    Callback = safe("AnchorButtonToggle", function(Value)
-        if Value then
-            createAnchorButton()
-        else
-            destroyAnchorButton()
-        end
-    end),
+    Callback = safe("AnchorButtonToggle", Anchor.Button.SetVisible),
 })
 
 ScriptsTab:CreateSection("Mobile Aimbot")
@@ -1969,9 +1777,7 @@ ScriptsTab:CreateSection("Mobile Aimbot")
 Aim.Toggle = ScriptsTab:CreateToggle({
     Name = "Aimbot (shows movable Aim button)",
     CurrentValue = false,
-    Callback = safe("AimbotToggle", function(Value)
-        setAimArmed(Value)
-    end),
+    Callback = safe("AimbotToggle", setAimArmed),
 })
 
 ScriptsTab:CreateDropdown({
@@ -2078,22 +1884,14 @@ NaniTab:CreateSection("Float (+170 studs)")
 Float.Toggle = NaniTab:CreateToggle({
     Name = "Teleport Up 170 Studs & Float",
     CurrentValue = false,
-    Callback = safe("FloatToggle", function(Value)
-        setFloat(Value)
-    end),
+    Callback = safe("FloatToggle", setFloat),
 })
 
 NaniTab:CreateToggle({
     Name = "Show On-Screen Float Button (movable)",
     CurrentValue = false,
     Flag = "FloatButtonToggle",
-    Callback = safe("FloatButtonToggle", function(Value)
-        if Value then
-            createFloatButton()
-        else
-            destroyFloatButton()
-        end
-    end),
+    Callback = safe("FloatButtonToggle", Float.Button.SetVisible),
 })
 
 ---------------------------------------------------------------------
@@ -2133,7 +1931,6 @@ SettingsTab:CreateButton({
     end),
 })
 
---// Startup notification
 Rayfield:Notify({
     Title = HUB_NAME .. " Loaded",
     Content = "Press K or tap the minimized button to show/hide the UI. Drag the bottom-right corner to resize.",
