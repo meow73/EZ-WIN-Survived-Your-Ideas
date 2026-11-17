@@ -1773,10 +1773,10 @@ ScriptsTab:CreateToggle({
 
 ScriptsTab:CreateSection("Mobile Aimbot")
 
--- No Flag on purpose: the aimbot toggle (and its movable Aim button) is never saved.
 Aim.Toggle = ScriptsTab:CreateToggle({
     Name = "Aimbot (shows movable Aim button)",
     CurrentValue = false,
+    Flag = "AimbotToggle",
     Callback = safe("AimbotToggle", setAimArmed),
 })
 
