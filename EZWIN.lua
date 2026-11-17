@@ -1334,7 +1334,6 @@ local AIM_CONFIG = {
 
 local Aim = {
     Armed = false,
-    ShowButton = false,
     Active = false,
     TargetPlayer = nil,
     TargetPart = nil,
@@ -1542,22 +1541,19 @@ Aim.Button = createButtonSlot({
     OnTap = function() setAimActive(not Aim.Active) end,
 })
 
-local function updateAimButton()
-    Aim.Button.SetVisible(Aim.Armed or Aim.ShowButton)
-end
-
--- "Armed" = the FOV circle exists and the Aim button is shown; tapping the button starts/stops aiming
+-- "Armed" = the on-screen Aim button and FOV circle exist; tapping the button starts/stops aiming
 local function setAimArmed(enabled)
     if enabled == Aim.Armed then return end
     Aim.Armed = enabled
 
     if enabled then
         createAimCircle()
+        Aim.Button.SetVisible(true)
     else
         setAimActive(false)
+        Aim.Button.SetVisible(false)
         destroyAimCircle()
     end
-    updateAimButton()
 end
 
 local stopAimWatch = watchCharacter({
@@ -1777,21 +1773,11 @@ ScriptsTab:CreateToggle({
 
 ScriptsTab:CreateSection("Mobile Aimbot")
 
--- No Flag on purpose: the aimbot on/off state is never saved, so you won't load in aiming.
+-- No Flag on purpose: the aimbot toggle (and its movable Aim button) is never saved.
 Aim.Toggle = ScriptsTab:CreateToggle({
     Name = "Aimbot (shows movable Aim button)",
     CurrentValue = false,
     Callback = safe("AimbotToggle", setAimArmed),
-})
-
-ScriptsTab:CreateToggle({
-    Name = "Show On-Screen Aim Button (movable)",
-    CurrentValue = false,
-    Flag = "AimButtonToggle",
-    Callback = safe("AimButtonToggle", function(Value)
-        Aim.ShowButton = Value
-        updateAimButton()
-    end),
 })
 
 ScriptsTab:CreateDropdown({
@@ -1876,7 +1862,7 @@ ScriptsTab:CreateToggle({
 ScriptsTab:CreateToggle({
     Name = "Show FOV Circle",
     CurrentValue = true,
-    Flag = "AimCircleToggle",
+    Flag = "AimShowFOVCircleToggle",
     Callback = safe("AimCircle", function(Value)
         Aim.Settings.ShowCircle = Value
         updateAimCircle()
